@@ -1,11 +1,13 @@
 // ==UserScript==
 // @name         Readoor 阅门户 云学堂视频自动播放完成
 // @namespace    byyxt-autoplay
-// @version      1.0.1-readoor
+// @version      1.1.0-readoor
 // @description  自动逐个播放 Readoor(阅门户/云学堂)平台的课程视频,完成后自动返回列表继续下一个,直到全部完成。适配 a.readoor.cn / app.readoor.cn / byyxt.pupedu.cn
 // @match        https://byyxt.pupedu.cn/*
 // @match        https://a.readoor.cn/*
 // @match        https://app.readoor.cn/*
+// @downloadURL  https://raw.githubusercontent.com/MARSONag/readoor-autoplay/main/readoor-autoplay.user.js
+// @updateURL    https://raw.githubusercontent.com/MARSONag/readoor-autoplay/main/readoor-autoplay.user.js
 // @run-at       document-start
 // @grant        none
 // ==/UserScript==
@@ -306,58 +308,139 @@
   }
 
   /* ====================== 课程播放页 ====================== */
-  function setupVideo(video) {
+  function rectOf(v) { try { return v.getBoundingClientRect(); } catch (e) { return { width: 0, height: 0 }; } }
+  function isVisible(v) {
+    try {
+      const r = rectOf(v);
+      const st = getComputedStyle(v);
+      return r.width > 80 && r.height > 40 && st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity || '1') > 0.1;
+    } catch (e) { return false; }
+  }
+  function allVideos() {
+    let vids = [...document.querySelectorAll('video')];
+    // 同源 iframe 里的播放器也算
+    for (const f of document.querySelectorAll('iframe')) {
+      try { const d = f.contentDocument; if (d) vids = vids.concat([...d.querySelectorAll('video')]); } catch (e) {}
+    }
+    return vids;
+  }
+  function pickVideo() {
+    const vids = allVideos();
+    if (!vids.length) return null;
+    const vis = vids.filter(isVisible);
+    const pool = vis.length ? vis : vids;
+    // 面积最大的那个最可能是主播放器（列表页缩略图/装饰视频面积很小）
+    return pool.sort((a, b) => {
+      const ra = rectOf(a), rb = rectOf(b);
+      return rb.width * rb.height - ra.width * ra.height;
+    })[0];
+  }
+  function describe(v) {
+    if (!v) return '未找到视频元素';
+    const r = rectOf(v);
+    const dur = Number.isFinite(v.duration) ? v.duration.toFixed(0) + 's' : '未知';
+    return `尺寸 ${Math.round(r.width)}×${Math.round(r.height)} | 已缓存 ${v.readyState}/4 | 时长 ${dur} | 进度 ${(v.currentTime || 0).toFixed(1)}s | 暂停 ${v.paused} | 倍速 ${v.playbackRate} | 错误 ${v.error ? v.error.code : '无'} | src ${(v.currentSrc || '').slice(0, 40)}`;
+  }
+  function clickPlayUi() {
+    const sels = ['.vjs-big-play-button', '.prism-big-play-btn', '.dplayer-play-icon', '.xgplayer-start',
+                  '.m-video-playbtn', '.play-btn', '.def_img_box', '[class*="big-play"]', '[class*="play-btn"]'];
+    for (const s of sels) {
+      const list = document.querySelectorAll(s);
+      for (const el of list) {
+        try {
+          const r = el.getBoundingClientRect();
+          if (r.width > 0 && r.height > 0) { el.click(); return true; }
+        } catch (e) {}
+      }
+    }
+    return false;
+  }
+
+  function setupVideo(video, rate) {
     try {
       video.muted = CFG.mute;
-      video.defaultPlaybackRate = CFG.rate;
-      video.playbackRate = CFG.rate;
+      video.defaultPlaybackRate = rate;
+      video.playbackRate = rate;
       const p = video.play();
       if (p && p.catch) p.catch(() => {});
     } catch (e) {}
   }
 
-  function pickVideo() {
-    const sels = ['.viewer-player video', '.video_player_box video', '.video_box video', '.video_content video', 'video'];
-    for (const s of sels) {
-      const v = document.querySelector(s);
-      if (v) return v;
-    }
-    return null;
-  }
-
+  // 持续维持"在播 + 目标倍速"；视频不走就逐级降倍速，最后提示手动点一下
   async function enforcePlayback(video) {
-    if (!video || video.done) return true;
+    if (!video) return false;
+    const RATES = [CFG.rate, 8, 4, 2, 1].filter((r, i, a) => a.indexOf(r) === i);
+    let rateIdx = 0;
     let finished = false;
+    let lastTime = -1, lastChange = Date.now(), tick = 0, manualHinted = false;
     const start = Date.now();
-    const endedHandler = () => { State.doneReported = true; finish(); };
-    const errorHandler = () => { finish(); };
-    video.addEventListener('ended', endedHandler, { once: true });
-    video.addEventListener('error', errorHandler, { once: true });
-    const finish = () => {
+
+    const finish = () => { if (finished) return; finished = true; clearInterval(iv); };
+    video.addEventListener('ended', () => { State.doneReported = true; finish(); }, { once: true });
+    video.addEventListener('error', finish, { once: true });
+    // 站点常在自己监听的 ratechange 里把倍速重置回 1，这里再抢回来
+    video.addEventListener('ratechange', () => {
       if (finished) return;
-      finished = true;
-      clearInterval(iv);
+      const want = RATES[rateIdx];
+      if (Math.abs(video.playbackRate - want) > 0.01) { try { video.playbackRate = want; } catch (e) {} }
+    });
+
+    const apply = () => {
+      const want = RATES[rateIdx];
+      try { if (!video.muted) video.muted = CFG.mute; } catch (e) {}
+      try { if (Math.abs(video.playbackRate - want) > 0.01) video.playbackRate = want; } catch (e) {}
     };
-    if (CFG.fastSeek && Number.isFinite(video.duration) && video.duration > 30) {
+    const play = () => {
+      apply();
+      try { const p = video.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
+    };
+    play();
+
+    if (CFG.fastSeek) {
       try {
         const seek = () => { video.currentTime = Math.max(0, video.duration - 1); };
-        if (video.readyState >= 1) seek(); else video.addEventListener('loadedmetadata', seek, { once: true });
+        if (video.readyState >= 1 && Number.isFinite(video.duration) && video.duration > 30) seek();
+        else video.addEventListener('loadedmetadata', seek, { once: true });
       } catch (e) {}
     }
+
     const iv = setInterval(() => {
       if (finished) return;
+      tick++;
       if (loginLimited()) { finish(); return; }
       if (State.doneReported || video.ended) { finish(); return; }
-      try {
-        if (video.paused && !video.ended) { const p = video.play(); if (p && p.catch) p.catch(() => {}); }
-        if (Math.abs(video.playbackRate - CFG.rate) > 0.01) video.playbackRate = CFG.rate;
-        if (!video.muted) video.muted = CFG.mute;
-      } catch (e) {}
-      if (Date.now() - start > CFG.maxWatchMs) {
-        log('超时未完成,跳过:', state.currentName);
-        finish();
+      if (Date.now() - start > CFG.maxWatchMs) { log('超时未完成,跳过:', state.currentName); finish(); return; }
+
+      if (Math.abs(video.currentTime - lastTime) > 0.05) {
+        lastTime = video.currentTime;
+        lastChange = Date.now();
+        manualHinted = false;
+        if (tick % 5 === 0) setStatus(`播放中: ${state.currentName} @${RATES[rateIdx]}x\n${describe(video)}`);
+        return;
+      }
+
+      if (video.paused && !video.ended) play();
+      else apply();
+
+      if (Date.now() - lastChange > 6000) {
+        if (rateIdx < RATES.length - 1) {
+          rateIdx++;
+          log('视频不动,降倍速到', RATES[rateIdx]);
+          clickPlayUi();
+          play();
+          setStatus(`视频没动，已降到 ${RATES[rateIdx]} 倍速重试…\n${describe(video)}`);
+        } else {
+          clickPlayUi();
+          play();
+          manualHinted = true;
+          setStatus(`视频始终没在走，请手动点一下视频中间的播放按钮（点一次即可，之后脚本自动接管）\n${describe(video)}`);
+        }
+        lastChange = Date.now();
+      } else if (!manualHinted && tick % 5 === 0) {
+        setStatus(`播放中: ${state.currentName} @${RATES[rateIdx]}x\n${describe(video)}`);
       }
     }, CFG.pollMs);
+
     await new Promise(r => { const t = setInterval(() => { if (finished) { clearInterval(t); r(); } }, 300); });
     return !!(State.doneReported || video.ended);
   }
@@ -376,7 +459,7 @@
   async function viewerLoop() {
     if (!state.running || state.stopped) return;
     if (loginLimited()) { warnStop('⚠ 检测到该账号存在其他登录(登录设备数超限),已停止。请在其他设备退出登录后重试'); return; }
-    setStatus(`播放中: ${state.currentName || '(课程)'}`);
+    setStatus(`正在寻找播放器: ${state.currentName || '(课程)'}`);
     const guid = new URLSearchParams(location.search).get('section_guid');
 
     let video = await waitFor(pickVideo, CFG.sectionTimeoutMs);
@@ -392,6 +475,7 @@
         video = await waitFor(pickVideo, 12000);
       }
     }
+    if (video) setStatus(`已找到播放器 @${CFG.rate}x\n${describe(video)}`);
 
     if (!video && !State.doneReported) {
       // 可能视频接口较慢或页面未就绪:整页重载一次再试(状态仍在 sessionStorage)
@@ -412,7 +496,7 @@
       saveState();
       setStatus('已完成,返回列表…');
     } else {
-      setupVideo(video);
+      setupVideo(video, CFG.rate);
       const ok = await enforcePlayback(video);
       if (ok) {
         state.doneCount = (state.doneCount || 0) + 1;
