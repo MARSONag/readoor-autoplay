@@ -1,349 +1,181 @@
 // ==UserScript==
-// @name         Readoor 阅门户 云学堂视频自动播放完成
-// @namespace    byyxt-autoplay
-// @version      1.1.0-readoor
-// @description  自动逐个播放 Readoor(阅门户/云学堂)平台的课程视频,完成后自动返回列表继续下一个,直到全部完成。适配 a.readoor.cn / app.readoor.cn / byyxt.pupedu.cn
+// @name         Readoor 阅门户 云学堂自动刷课
+// @namespace    readoor-autoplay
+// @version      2.0.0
+// @description  在 Readoor(阅门户/云学堂)课程页自动 16 倍速播放，一节看完自动点「课程目录」里的下一节，逐节刷完。适配 a.readoor.cn / app.readoor.cn / byyxt.pupedu.cn
 // @match        https://byyxt.pupedu.cn/*
 // @match        https://a.readoor.cn/*
 // @match        https://app.readoor.cn/*
 // @downloadURL  https://raw.githubusercontent.com/MARSONag/readoor-autoplay/main/readoor-autoplay.user.js
 // @updateURL    https://raw.githubusercontent.com/MARSONag/readoor-autoplay/main/readoor-autoplay.user.js
-// @run-at       document-start
+// @run-at       document-idle
 // @grant        none
 // ==/UserScript==
 
 (function () {
   'use strict';
 
-  /* ====================== 配置 ====================== */
   const CFG = {
-    autoStart: true,          // 进入任务详情页后自动开始
-    rate: 16,                 // 播放倍速(Chrome 最大 16)
-    mute: true,               // 静音播放(绕过自动播放限制)
-    fastSeek: false,          // true:先尝试直接跳到结尾(仅在未开启防拖拽时生效)
-    doneWaitMs: 3500,         // 服务端确认完成后的停留时间
-    sectionTimeoutMs: 30000,  // 等待课程区域/视频出现的超时
-    maxWatchMs: 45 * 60 * 1000, // 单个视频最长等待(到时间还没完成就跳过)
-    pollMs: 700,              // 状态轮询间隔
+    rate: 16,               // 起始倍速
+    mute: true,             // 静音（绕过浏览器自动播放限制）
+    autoNext: true,         // 一节看完自动点下一节
+    autoStart: true,        // 页面里没有在播视频时，自动挑一节没看过的点开
+    pollMs: 800,            // 轮询间隔
+    advanceDelayMs: 1500,   // 点下一节前的停顿
+    stallLimitMs: 5000,     // 进度不动多久算卡住，开始降倍速
+    autoStartIdleMs: 5000,  // 页面闲置多久后自动挑一节开始
   };
-  // 允许外部程序(命令行执行器)覆盖配置
-  try { if (window.__BYYXT_CONFIG__) Object.assign(CFG, window.__BYYXT_CONFIG__); } catch (e) {}
+  const RATES = [CFG.rate, 8, 4, 2, 1].filter((r, i, a) => a.indexOf(r) === i);
 
-  const STATE_KEY = '__byyxt_autoplay__';
-  // pStatIf 完成上报加密密钥(平台前端内置的固定值)
-  const AES_KEY_HEX = '8c1ef35c1a24f94ce6422f3c4b77e19bec2aaec9c0d72251b82ccf40b22561a84c876c19d2cb9a';
+  // 目录行文字形如「1.1.3中国现代国防观」「1.1.1国防的内涵」
+  const ROW_RE = /^\s*\d+(\.\d+){1,3}\s*[^\d\s]/;
 
-  const log = (...a) => console.log('%c[byyxt]', 'color:#0b8a5f;font-weight:bold', ...a);
-
-  /* ====================== 状态 ====================== */
-  const State = { doneReported: false };
-
-  let state = {
-    running: false,
-    paused: false,
-    stopped: false,
-    returnUrl: '',
-    currentName: '',
-    totalPending: null,
-    doneCount: 0,
-    playCounts: {},
-    attempts: {},   // 课程名 -> 尝试次数
-    skip: [],       // 跳过名单
+  const S = {
+    rows: [], idx: -1, rateIdx: 0, done: false, advancing: false,
+    lastSrc: '', lastTime: -1, lastChange: Date.now(), idleSince: Date.now(),
+    stalledHint: false, stopped: false, paused: false, finishedCount: 0,
   };
 
-  function loadState() {
-    try {
-      const raw = sessionStorage.getItem(STATE_KEY);
-      if (raw) state = Object.assign(state, JSON.parse(raw));
-    } catch (e) {}
-  }
-  function saveState() {
-    try { sessionStorage.setItem(STATE_KEY, JSON.stringify(state)); } catch (e) {}
-  }
-  function resetState() {
-    state = { running: false, paused: false, stopped: false, returnUrl: '', currentName: '', totalPending: null, doneCount: 0, playCounts: {}, attempts: {}, skip: [] };
-    try { sessionStorage.removeItem(STATE_KEY); } catch (e) {}
-  }
+  const log = (...a) => console.log('%c[readoor]', 'color:#0b8a5f;font-weight:bold', ...a);
 
-  /* ====================== 加密 / 完成上报检测 ====================== */
-  function hexToBytes(hex) {
-    const out = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
-    return out;
-  }
-  function b64ToBytes(b64) {
-    const bin = atob(b64);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  }
-  async function decryptPayload(body) {
-    let obj = body;
-    if (typeof body === 'string') obj = JSON.parse(body);
-    if (!obj || typeof obj !== 'object' || !obj.data || !obj.jfug) return null;
-    const keyBuf = await crypto.subtle.digest('SHA-256', hexToBytes(AES_KEY_HEX));
-    const key = await crypto.subtle.importKey('raw', keyBuf, { name: 'AES-CBC' }, false, ['decrypt']);
-    const iv = b64ToBytes(obj.jfug);
-    const ct = b64ToBytes(obj.data);
-    const pt = await crypto.subtle.decrypt({ name: 'AES-CBC', iv }, key, ct);
-    return JSON.parse(new TextDecoder().decode(pt));
-  }
-  function isDoneReport(payload) {
-    try {
-      const base = payload && payload.base_data;
-      const lesson = payload && payload.lesson_data && payload.lesson_data[0];
-      if (!base || !lesson) return false;
-      const key = btoa(String(base.time_stamp)).slice(2, 8);
-      return String(lesson[key]) === '1';
-    } catch (e) {
-      return false;
-    }
-  }
-
-  function hookPStatIf() {
-    const origOpen = XMLHttpRequest.prototype.open;
-    const origSend = XMLHttpRequest.prototype.send;
-    XMLHttpRequest.prototype.open = function (method, url, ...rest) {
-      try { this.__byyxtUrl = typeof url === 'string' ? url : String(url); } catch (e) {}
-      return origOpen.apply(this, arguments);
-    };
-    XMLHttpRequest.prototype.send = function (body) {
-      try {
-        const url = this.__byyxtUrl || '';
-        if (url.includes('stat/pStatIf')) {
-          const xhr = this;
-          xhr.addEventListener('loadend', () => {
-            decryptPayload(body).then(payload => {
-              if (isDoneReport(payload)) {
-                State.doneReported = true;
-                log('检测到完成上报(服务端已收到)');
-              }
-            }).catch(() => {});
-          });
-        }
-      } catch (e) {}
-      return origSend.apply(this, arguments);
-    };
-  }
-
-  /* ====================== 拦截 window.open,把课程页转到当前标签 ====================== */
-  function hookWindowOpen() {
-    const orig = window.open;
-    window.open = function (url, name, features) {
-      try {
-        const u = String(url || '');
-        if (/\/c\/pc\/viewer|\/e-textbook2/.test(u) && /pupedu\.cn|readoor\.cn/.test(location.hostname)) {
-          try { sessionStorage.setItem(STATE_KEY + '_nav', u); } catch (e) {}
-          setTimeout(() => { location.assign(u); }, 60);
-          return null;
-        }
-      } catch (e) {}
-      return orig.apply(this, arguments);
-    };
-  }
-
-  /* ====================== 通用工具 ====================== */
-  const sleep = ms => new Promise(r => setTimeout(r, ms));
-  async function waitFor(fn, timeout, interval = 500) {
-    const start = Date.now();
-    while (Date.now() - start < timeout) {
-      try { const v = fn(); if (v) return v; } catch (e) {}
-      await sleep(interval);
-    }
-    return null;
-  }
-  const isTrainingPage = () => /\/statudentsHomeDetails/.test(location.pathname);
-  const isViewerPage = () => /\/c\/pc\/viewer|\/e-textbook2/.test(location.pathname);
-  const loginLimited = () => /登录超过最大限制数|登录设备数超限|已在别处登录|账号在其它设备登录/.test(document.body ? document.body.innerText : '');
-  const warnStop = msg => {
-    state.running = false;
-    saveState();
-    setStatus(msg);
-  };
-
-  /* ====================== 悬浮面板 ====================== */
+  /* ====================== 面板 ====================== */
   let panel = null, statusEl = null;
-  function ensurePanel() {
+  function mountPanel() {
     if (panel || !document.body) return;
     panel = document.createElement('div');
-    panel.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:999999;background:#0f172a;color:#e2e8f0;' +
+    panel.style.cssText = 'position:fixed;right:14px;bottom:14px;z-index:2147483647;background:#0f172a;color:#e2e8f0;' +
       'font:13px/1.5 system-ui,"Microsoft YaHei",sans-serif;border-radius:10px;padding:10px 12px;' +
-      'box-shadow:0 8px 24px rgba(0,0,0,.35);max-width:300px;';
-    const title = document.createElement('div');
-    title.textContent = 'Readoor 视频自动播放';
-    title.style.cssText = 'font-weight:700;margin-bottom:4px;';
+      'box-shadow:0 8px 24px rgba(0,0,0,.35);width:300px;';
+    const t = document.createElement('div');
+    t.textContent = 'Readoor 自动刷课 v2';
+    t.style.cssText = 'font-weight:700;margin-bottom:6px;';
     statusEl = document.createElement('div');
-    statusEl.id = 'byyxt-status';
-    statusEl.style.cssText = 'color:#94a3b8;min-height:20px;white-space:pre-wrap;word-break:break-all;max-height:180px;overflow:auto;';
+    statusEl.style.cssText = 'color:#94a3b8;white-space:pre-wrap;word-break:break-all;max-height:150px;overflow:auto;min-height:36px;';
     const bar = document.createElement('div');
-    bar.style.cssText = 'display:flex;gap:8px;margin-top:6px;';
-    const mkBtn = (text, fn) => {
+    bar.style.cssText = 'display:flex;gap:6px;margin-top:8px;';
+    const mk = (label, fn) => {
       const b = document.createElement('button');
-      b.textContent = text;
-      b.style.cssText = 'flex:1;border:0;border-radius:6px;padding:4px 0;cursor:pointer;font-size:12px;';
-      b.style.background = '#334155';
-      b.style.color = '#e2e8f0';
+      b.textContent = label;
+      b.style.cssText = 'flex:1;border:0;border-radius:6px;padding:5px 0;cursor:pointer;font-size:12px;background:#334155;color:#e2e8f0;';
       b.onclick = fn;
       return b;
     };
-    const pauseBtn = mkBtn('暂停', () => {
-      state.paused = !state.paused;
-      saveState();
-      pauseBtn.textContent = state.paused ? '继续' : '暂停';
-      if (!state.paused) run();
-    });
-    const stopBtn = mkBtn('停止', () => {
-      state.running = false; state.stopped = true; saveState();
-      setStatus('已停止');
-    });
-    bar.append(pauseBtn, stopBtn);
-    panel.append(title, statusEl, bar);
+    bar.append(
+      mk('暂停', () => { S.paused = !S.paused; setStatus(S.paused ? '已暂停（点「暂停」继续）' : '继续…'); }),
+      mk('下一个', () => advance(true)),
+      mk('停止', () => { S.stopped = true; setStatus('已停止'); })
+    );
+    panel.append(t, statusEl, bar);
     document.body.appendChild(panel);
   }
-  function setStatus(text) {
-    log(text);
-    ensurePanel();
-    if (statusEl) statusEl.textContent = text;
-  }
+  function setStatus(text) { log(text); mountPanel(); if (statusEl) statusEl.textContent = text; }
 
-  /* ====================== 任务列表页 ====================== */
-  function getItemName(el) {
-    const s = el.querySelector('.categroy_item_left span');
-    return (s ? s.textContent : '').trim() || '(未知课程)';
-  }
-  function isVideoItem(el) {
-    const img = el.querySelector('img.CoursewareIcon');
-    if (!img) return false;
-    const src = img.getAttribute('src') || '';
-    return /video_icon\.png|video\.png/.test(src);
-  }
-  function isDoneItem(el) {
-    const icon = el.querySelector('.done_box .ymhicon');
-    const cls = icon ? icon.className : '';
-    return /Union|successTrainTeg/.test(cls);
-  }
-  function getPendingVideos() {
-    return [...document.querySelectorAll('.categroy_item')].filter(el =>
-      isVideoItem(el) && !isDoneItem(el) && !state.skip.includes(getItemName(el))
-    );
-  }
-  async function clickTabByName(text) {
-    const tabs = [...document.querySelectorAll('.headerBox p, .tabBox p, p.active')];
-    const tab = tabs.find(t => (t.textContent || '').includes(text));
-    if (tab) { tab.click(); await sleep(2500); }
-  }
-  function recordAttempt(name) {
-    state.attempts[name] = (state.attempts[name] || 0) + 1;
-    if (state.attempts[name] >= 2 && !state.skip.includes(name)) {
-      state.skip.push(name);
-      log('连续两次无法完成,跳过:', name);
+  /* ====================== 目录行识别 ====================== */
+  function rowText(el) { return (el.textContent || '').replace(/\s+/g, ' ').trim(); }
+
+  function getRows() {
+    const out = [];
+    const nodes = document.querySelectorAll('div,li,a,span');
+    for (const el of nodes) {
+      const tx = rowText(el);
+      if (!tx || tx.length > 70 || !ROW_RE.test(tx)) continue;
+      const r = el.getBoundingClientRect();
+      if (r.height < 12 || r.height > 110 || r.width < 70) continue;
+      // 只保留最内层的那个（外层容器也会匹配到同样的文字）
+      let hasInner = false;
+      for (const c of el.querySelectorAll('div,li,a,span')) {
+        if (ROW_RE.test(rowText(c))) { hasInner = true; break; }
+      }
+      if (hasInner) continue;
+      out.push(el);
     }
-    saveState();
+    // 同一行文字只保留一个
+    const seen = new Set();
+    const rows = [];
+    for (const el of out) {
+      const tx = rowText(el);
+      if (seen.has(tx)) continue;
+      seen.add(tx);
+      rows.push(el);
+    }
+    rows.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+    return rows;
   }
 
-  async function trainingLoop() {
-    if (!state.running || state.paused || state.stopped) return;
-    // 外部(测试驱动)可写入该标记让脚本在下一轮停止
+  // 已完成的行后面有个绿色对勺，尽力识别
+  function rowDone(row) {
+    const html = (row.innerHTML || '').slice(0, 600);
+    if (/success|checked|complete|finish|done|yiwancheng|isok/i.test(html)) return true;
+    const nodes = row.querySelectorAll('img,svg,i,use');
+    for (const n of nodes) {
+      const s = (n.getAttribute && (n.getAttribute('src') || n.getAttribute('xlink:href') || n.getAttribute('href') || n.getAttribute('class') || n.getAttribute('data-icon') || '')) || '';
+      if (/success|check|done|complete|finish|yes|dui|tick/i.test(s)) return true;
+    }
+    return false;
+  }
+
+  function findRowFrom(node) {
+    let el = node;
+    for (let i = 0; i < 8 && el && el !== document.body; i++) {
+      if (S.rows && S.rows.indexOf(el) >= 0) return el;
+      if (el.nodeType === 1 && ROW_RE.test(rowText(el))) {
+        const r = el.getBoundingClientRect();
+        if (r.height <= 110 && r.height >= 12) return el;
+      }
+      el = el.parentElement;
+    }
+    return null;
+  }
+
+  // 用户（或脚本）点了哪一行，都记下来，用于「下一个」
+  document.addEventListener('click', function (e) {
     try {
-      if (sessionStorage.getItem('__byyxt_autoplay_stop__') === '1') {
-        state.running = false;
-        saveState();
-        setStatus('⏹ 已按限制停止');
-        return;
+      const row = findRowFrom(e.target);
+      if (!row) return;
+      const rows = S.rows && S.rows.length ? S.rows : getRows();
+      let i = -1;
+      for (let k = 0; k < rows.length; k++) {
+        if (rows[k] === row || rowText(rows[k]) === rowText(row)) { i = k; break; }
       }
-    } catch (e) {}
-    if (loginLimited()) { warnStop('⚠ 检测到该账号存在其他登录(登录设备数超限),已停止。请在其他设备退出登录后重试'); return; }
-    await waitFor(() => document.querySelector('.categroy_item'), 30000);
-    let items = getPendingVideos();
-    if (!items.length) {
-      if (loginLimited()) { warnStop('⚠ 检测到该账号存在其他登录(登录设备数超限),已停止。请在其他设备退出登录后重试'); return; }
-      await clickTabByName('内容目录');
-      await waitFor(() => document.querySelector('.categroy_item'), 15000);
-      items = getPendingVideos();
-    }
-    if (loginLimited()) { warnStop('⚠ 检测到该账号存在其他登录(登录设备数超限),已停止。请在其他设备退出登录后重试'); return; }
-    if (!items.length) {
-      setStatus('✅ 没有待处理的视频(已全部完成或已跳过)');
-      state.running = false;
-      saveState();
-      return;
-    }
-    if (state.totalPending === null) {
-      state.totalPending = items.length;
-      saveState();
-    }
-    const item = items[0];
-    const name = getItemName(item);
-    const played = (state.playCounts && state.playCounts[name]) || 0;
-    if (played >= 2) {
-      if (!state.skip.includes(name)) {
-        state.skip.push(name);
-        saveState();
-      }
-      if (items.length <= 1) {
-        state.running = false;
-        saveState();
-        setStatus('⚠ 同一视频反复播放仍未被标记完成,可能是登录失效或任务未开放,已停止');
-        return;
-      }
-      setStatus(`跳过反复无法完成的视频: ${name}`);
-      await sleep(300);
-      trainingLoop();
-      return;
-    }
-    state.playCounts[name] = played + 1;
-    state.currentName = name;
-    state.returnUrl = location.href;
-    saveState();
-    setStatus(`待处理 ${items.length}/${state.totalPending} 个 → 打开: ${name}`);
-    try { item.scrollIntoView({ block: 'center' }); } catch (e) {}
-    item.click();
-    await sleep(2500);
-    if (isTrainingPage()) {
-      recordAttempt(name);
-      setStatus('页面未跳转,尝试下一个…');
-      await sleep(500);
-      trainingLoop();
-    }
-  }
+      if (i >= 0) { S.idx = i; S.stalledHint = false; S.done = false; }
+    } catch (err) {}
+  }, true);
 
-  /* ====================== 课程播放页 ====================== */
+  /* ====================== 视频 ====================== */
   function rectOf(v) { try { return v.getBoundingClientRect(); } catch (e) { return { width: 0, height: 0 }; } }
-  function isVisible(v) {
+  function visible(v) {
     try {
       const r = rectOf(v);
       const st = getComputedStyle(v);
-      return r.width > 80 && r.height > 40 && st.display !== 'none' && st.visibility !== 'hidden' && parseFloat(st.opacity || '1') > 0.1;
+      return r.width > 60 && r.height > 30 && st.display !== 'none' && st.visibility !== 'hidden';
     } catch (e) { return false; }
   }
-  function allVideos() {
-    let vids = [...document.querySelectorAll('video')];
-    // 同源 iframe 里的播放器也算
-    for (const f of document.querySelectorAll('iframe')) {
-      try { const d = f.contentDocument; if (d) vids = vids.concat([...d.querySelectorAll('video')]); } catch (e) {}
-    }
-    return vids;
-  }
   function pickVideo() {
-    const vids = allVideos();
+    let vids = [].slice.call(document.querySelectorAll('video'));
+    const ifr = document.querySelectorAll('iframe');
+    for (const f of ifr) {
+      try { const d = f.contentDocument; if (d) vids = vids.concat([].slice.call(d.querySelectorAll('video'))); } catch (e) {}
+    }
     if (!vids.length) return null;
-    const vis = vids.filter(isVisible);
+    const vis = vids.filter(visible);
     const pool = vis.length ? vis : vids;
-    // 面积最大的那个最可能是主播放器（列表页缩略图/装饰视频面积很小）
-    return pool.sort((a, b) => {
+    return pool.sort(function (a, b) {
       const ra = rectOf(a), rb = rectOf(b);
       return rb.width * rb.height - ra.width * ra.height;
     })[0];
   }
   function describe(v) {
-    if (!v) return '未找到视频元素';
+    if (!v) return '无视频';
     const r = rectOf(v);
     const dur = Number.isFinite(v.duration) ? v.duration.toFixed(0) + 's' : '未知';
-    return `尺寸 ${Math.round(r.width)}×${Math.round(r.height)} | 已缓存 ${v.readyState}/4 | 时长 ${dur} | 进度 ${(v.currentTime || 0).toFixed(1)}s | 暂停 ${v.paused} | 倍速 ${v.playbackRate} | 错误 ${v.error ? v.error.code : '无'} | src ${(v.currentSrc || '').slice(0, 40)}`;
+    return '尺寸 ' + Math.round(r.width) + '×' + Math.round(r.height) + ' | 缓存 ' + v.readyState + '/4 | 时长 ' + dur +
+      ' | 进度 ' + (v.currentTime || 0).toFixed(1) + 's | 暂停 ' + v.paused + ' | 倍速 ' + v.playbackRate +
+      ' | 错误 ' + (v.error ? v.error.code : '无');
   }
+
   function clickPlayUi() {
     const sels = ['.vjs-big-play-button', '.prism-big-play-btn', '.dplayer-play-icon', '.xgplayer-start',
-                  '.m-video-playbtn', '.play-btn', '.def_img_box', '[class*="big-play"]', '[class*="play-btn"]'];
+      '.m-video-playbtn', '.play-btn', '.def_img_box', '[class*="big-play"]', '[class*="play-btn"]', '[class*="playIcon"]'];
     for (const s of sels) {
       const list = document.querySelectorAll(s);
       for (const el of list) {
@@ -356,198 +188,132 @@
     return false;
   }
 
-  function setupVideo(video, rate) {
+  function playVideo(video) {
     try {
-      video.muted = CFG.mute;
-      video.defaultPlaybackRate = rate;
-      video.playbackRate = rate;
-      const p = video.play();
-      if (p && p.catch) p.catch(() => {});
+      if (!video.muted) video.muted = CFG.mute;
+      const want = RATES[S.rateIdx];
+      if (Math.abs(video.playbackRate - want) > 0.01) video.playbackRate = want;
+      if (video.paused && !video.ended) {
+        const p = video.play();
+        if (p && p.catch) p.catch(function () {});
+      }
     } catch (e) {}
   }
 
-  // 持续维持"在播 + 目标倍速"；视频不走就逐级降倍速，最后提示手动点一下
-  async function enforcePlayback(video) {
-    if (!video) return false;
-    const RATES = [CFG.rate, 8, 4, 2, 1].filter((r, i, a) => a.indexOf(r) === i);
-    let rateIdx = 0;
-    let finished = false;
-    let lastTime = -1, lastChange = Date.now(), tick = 0, manualHinted = false;
-    const start = Date.now();
+  /* ====================== 主循环 ====================== */
+  function advance(manual) {
+    if (S.stopped) return;
+    const rows = getRows();
+    if (!rows.length) { setStatus('没找到「课程目录」条目，请确认这个页面有目录列表'); return; }
 
-    const finish = () => { if (finished) return; finished = true; clearInterval(iv); };
-    video.addEventListener('ended', () => { State.doneReported = true; finish(); }, { once: true });
-    video.addEventListener('error', finish, { once: true });
-    // 站点常在自己监听的 ratechange 里把倍速重置回 1，这里再抢回来
-    video.addEventListener('ratechange', () => {
-      if (finished) return;
-      const want = RATES[rateIdx];
-      if (Math.abs(video.playbackRate - want) > 0.01) { try { video.playbackRate = want; } catch (e) {} }
-    });
-
-    const apply = () => {
-      const want = RATES[rateIdx];
-      try { if (!video.muted) video.muted = CFG.mute; } catch (e) {}
-      try { if (Math.abs(video.playbackRate - want) > 0.01) video.playbackRate = want; } catch (e) {}
-    };
-    const play = () => {
-      apply();
-      try { const p = video.play(); if (p && p.catch) p.catch(() => {}); } catch (e) {}
-    };
-    play();
-
-    if (CFG.fastSeek) {
-      try {
-        const seek = () => { video.currentTime = Math.max(0, video.duration - 1); };
-        if (video.readyState >= 1 && Number.isFinite(video.duration) && video.duration > 30) seek();
-        else video.addEventListener('loadedmetadata', seek, { once: true });
-      } catch (e) {}
+    if (S.idx < 0) {
+      let i = -1;
+      for (let k = 0; k < rows.length; k++) { if (!rowDone(rows[k])) { i = k; break; } }
+      S.idx = i;
+      if (S.idx < 0) { setStatus('目录里所有条目都已完成 ✅'); return; }
     }
+    const next = rows[S.idx + 1];
+    if (!next) { setStatus('已经刷到目录最后一条了 ✅（完成 ' + S.finishedCount + ' 节）'); return; }
 
-    const iv = setInterval(() => {
-      if (finished) return;
-      tick++;
-      if (loginLimited()) { finish(); return; }
-      if (State.doneReported || video.ended) { finish(); return; }
-      if (Date.now() - start > CFG.maxWatchMs) { log('超时未完成,跳过:', state.currentName); finish(); return; }
-
-      if (Math.abs(video.currentTime - lastTime) > 0.05) {
-        lastTime = video.currentTime;
-        lastChange = Date.now();
-        manualHinted = false;
-        if (tick % 5 === 0) setStatus(`播放中: ${state.currentName} @${RATES[rateIdx]}x\n${describe(video)}`);
-        return;
-      }
-
-      if (video.paused && !video.ended) play();
-      else apply();
-
-      if (Date.now() - lastChange > 6000) {
-        if (rateIdx < RATES.length - 1) {
-          rateIdx++;
-          log('视频不动,降倍速到', RATES[rateIdx]);
-          clickPlayUi();
-          play();
-          setStatus(`视频没动，已降到 ${RATES[rateIdx]} 倍速重试…\n${describe(video)}`);
-        } else {
-          clickPlayUi();
-          play();
-          manualHinted = true;
-          setStatus(`视频始终没在走，请手动点一下视频中间的播放按钮（点一次即可，之后脚本自动接管）\n${describe(video)}`);
-        }
-        lastChange = Date.now();
-      } else if (!manualHinted && tick % 5 === 0) {
-        setStatus(`播放中: ${state.currentName} @${RATES[rateIdx]}x\n${describe(video)}`);
-      }
-    }, CFG.pollMs);
-
-    await new Promise(r => { const t = setInterval(() => { if (finished) { clearInterval(t); r(); } }, 300); });
-    return !!(State.doneReported || video.ended);
+    S.idx = S.idx + 1;
+    S.advancing = true;
+    S.done = false;
+    S.stalledHint = false;
+    S.lastTime = -1;
+    S.lastChange = Date.now();
+    S.rateIdx = 0;
+    try { next.scrollIntoView({ block: 'center' }); } catch (e) {}
+    try { next.click(); } catch (e) {}
+    setStatus((manual ? '手动' : '自动') + '切到下一节: ' + rowText(next));
+    setTimeout(function () { S.advancing = false; }, CFG.advanceDelayMs + 2000);
   }
 
-  function goBack() {
-    const ret = state.returnUrl;
-    if (ret && ret !== location.href) {
-      location.assign(ret);
-    } else if (history.length > 1) {
-      history.back();
-    } else {
-      location.assign(ret || '/');
-    }
-  }
+  function tick() {
+    if (S.stopped || S.paused) return;
+    mountPanel();
 
-  async function viewerLoop() {
-    if (!state.running || state.stopped) return;
-    if (loginLimited()) { warnStop('⚠ 检测到该账号存在其他登录(登录设备数超限),已停止。请在其他设备退出登录后重试'); return; }
-    setStatus(`正在寻找播放器: ${state.currentName || '(课程)'}`);
-    const guid = new URLSearchParams(location.search).get('section_guid');
+    const rows = getRows();
+    if (rows.length) S.rows = rows;
 
-    let video = await waitFor(pickVideo, CFG.sectionTimeoutMs);
+    const video = pickVideo();
 
-    // 旧版课程区域兜底:展开标题并点播放遮罩
-    if (!video && guid) {
-      const section = await waitFor(() => document.getElementById(guid), 8000);
-      if (section) {
-        const title = section.querySelector('.video_title');
-        if (title) { try { title.click(); } catch (e) {} await sleep(600); }
-        const overlay = section.querySelector('.def_img_box') || document.querySelector('.def_img_box');
-        if (overlay) { try { overlay.click(); } catch (e) {} }
-        video = await waitFor(pickVideo, 12000);
-      }
-    }
-    if (video) setStatus(`已找到播放器 @${CFG.rate}x\n${describe(video)}`);
-
-    if (!video && !State.doneReported) {
-      // 可能视频接口较慢或页面未就绪:整页重载一次再试(状态仍在 sessionStorage)
-      if (!new URL(location.href).searchParams.has('__retry')) {
-        const u = new URL(location.href);
-        u.searchParams.set('__retry', '1');
-        location.replace(u.toString());
-        return;
-      }
-      recordAttempt(state.currentName);
-      setStatus('未找到视频,返回列表');
-      goBack();
+    if (!video) {
+      if (CFG.autoStart && S.idx < 0 && rows.length && Date.now() - S.idleSince > CFG.autoStartIdleMs) advance(false);
+      else render(null);
       return;
     }
 
-    if (State.doneReported) {
-      state.doneCount = (state.doneCount || 0) + 1;
-      saveState();
-      setStatus('已完成,返回列表…');
-    } else {
-      setupVideo(video, CFG.rate);
-      const ok = await enforcePlayback(video);
-      if (ok) {
-        state.doneCount = (state.doneCount || 0) + 1;
-        saveState();
-        setStatus('已完成,返回列表…');
+    const src = (video.currentSrc || '').slice(-50);
+    if (src !== S.lastSrc) {
+      S.lastSrc = src;
+      S.done = false;
+      S.stalledHint = false;
+      S.lastTime = -1;
+      S.lastChange = Date.now();
+      S.rateIdx = 0;
+    }
+
+    if (video.ended) {
+      if (!S.done) {
+        S.done = true;
+        S.finishedCount++;
+        setStatus('本节播完 ✅ 共完成 ' + S.finishedCount + ' 节');
+      }
+      if (CFG.autoNext && !S.advancing) advance(false);
+      return;
+    }
+
+    playVideo(video);
+
+    if (Math.abs(video.currentTime - S.lastTime) > 0.05) {
+      S.lastTime = video.currentTime;
+      S.lastChange = Date.now();
+      S.stalledHint = false;
+    } else if (Date.now() - S.lastChange > CFG.stallLimitMs) {
+      if (S.rateIdx < RATES.length - 1) {
+        S.rateIdx++;
+        log('进度不动，降到 ' + RATES[S.rateIdx] + ' 倍速');
+        clickPlayUi();
+        playVideo(video);
       } else {
-        recordAttempt(state.currentName);
-        setStatus('视频播放异常,返回列表重试');
+        S.stalledHint = true;
+        clickPlayUi();
       }
+      S.lastChange = Date.now();
     }
-    await sleep(CFG.doneWaitMs);
-    goBack();
+
+    render(video);
   }
 
-  /* ====================== 主入口 ====================== */
-  function run() {
-    loadState();
-    ensurePanel();
-    if (!state.running || state.paused || state.stopped) {
-      if (state.stopped) setStatus('已停止');
-      return;
-    }
-    if (isTrainingPage()) trainingLoop();
-    else if (isViewerPage()) viewerLoop();
+  function render(video) {
+    const rows = S.rows || [];
+    const cur = (S.idx >= 0 && rows[S.idx]) ? rowText(rows[S.idx]) : '（未选中）';
+    const head = '当前 ' + (S.idx >= 0 ? (S.idx + 1) : '?') + '/' + rows.length + '：' + cur;
+    let body = describe(video);
+    if (!video) body = '这个页面没有找到 video 元素（可能在 iframe 里或还没加载出来）。';
+    else if (S.stalledHint) body += '\n\n视频不动：请手动点一下视频中间的播放按钮，点一次即可，之后脚本接管。';
+    else body += '\n已完成 ' + S.finishedCount + ' 节，倍速 ' + RATES[S.rateIdx] + 'x';
+    setStatus(head + '\n' + body);
   }
 
-  function bootOnce() {
-    ensurePanel();
-    if (CFG.autoStart && isTrainingPage() && !state.stopped) {
-      state.running = true;
-      saveState();
-      setStatus('自动播放已启动,正在扫描视频…');
-      trainingLoop();
-      return;
-    }
-    if (isViewerPage()) { run(); return; }
-    // 两个都不匹配时:不自动跑,只在面板上把当前路径打出来,方便你按实际情况改下面的判断
-    setStatus('未识别当前页面路径: ' + location.pathname + '\n如需适配,请把这段加进 isTrainingPage/isViewerPage');
-    ensurePanel();
-  }
-
+  /* ====================== 启动 ====================== */
   function boot() {
-    try { hookWindowOpen(); } catch (e) { log('window.open 拦截失败', e); }
-    try { hookPStatIf(); } catch (e) { log('上报拦截失败', e); }
-    loadState();
-    if (document.readyState === 'loading') {
-      document.addEventListener('DOMContentLoaded', bootOnce);
-    } else {
-      bootOnce();
-    }
+    mountPanel();
+    setStatus('已加载，正在等待课程页…');
+    let n = 0;
+    const wait = setInterval(function () {
+      n++;
+      const ok = document.querySelector('video') || getRows().length;
+      if (ok || n > 40) {
+        clearInterval(wait);
+        S.idleSince = Date.now();
+        setStatus('已接管，开始扫描…');
+        tick();
+        setInterval(tick, CFG.pollMs);
+      }
+    }, 500);
   }
 
-  boot();
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot);
+  else boot();
 })();
